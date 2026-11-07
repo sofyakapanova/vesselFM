@@ -113,7 +113,19 @@ def main(cfg):
     # load model and ckpt
     model = load_model(cfg, device)
     model.to(device)
-    model.eval()
+
+    # --- TTA: разморозка Norm-слоёв ---
+    for param in model.parameters():
+        param.requires_grad = False
+    unfrozen = []
+    for name, module in model.named_modules():
+        if 'norm' in name.lower() or 'bn' in name.lower():
+            for param in module.parameters():
+                param.requires_grad = True
+                unfrozen.append(param)
+    optimizer_tta = torch.optim.Adam(unfrozen, lr=1e-4)
+    model.train()  # Важно для обновления Norm
+    logger.info(f"TTA: разморожено параметров {len(unfrozen)}")
 
     # init pre-processing transforms
     transforms = generate_transforms(cfg.transforms_config)
@@ -126,9 +138,6 @@ def main(cfg):
     logger.info(f"Found {len(image_paths)} images in {cfg.image_path}.")
 
     # init sliding window inferer
-    logger.debug(f"Sliding window patch size: {cfg.patch_size}")
-    logger.debug(f"Sliding window batch size: {cfg.batch_size}.")
-    logger.debug(f"Sliding window overlap: {cfg.overlap}.")
     inferer = SlidingWindowInfererAdapt(
         roi_size=cfg.patch_size, sw_batch_size=cfg.batch_size, overlap=cfg.overlap, 
         mode=cfg.mode, sigma_scale=cfg.sigma_scale, padding_mode=cfg.padding_mode
@@ -147,7 +156,43 @@ def main(cfg):
                 image, spacing = read_nifti(image_path)
                 image = transforms(image.astype(np.float32))[None].to(device)
                 mask = torch.tensor(read_nifti(mask_paths[idx])[0]).bool() if mask_paths else None
-  
+
+                # --- TTA шаг (только для масштаба 1) ---
+                if scale == 1: # and False:  # <--- Временно отключаем TTA
+                    model.train()
+                    optimizer_tta.zero_grad()
+                    with torch.enable_grad():
+                        # Вырезаем центральный патч 64x64x64 для экономии памяти
+                        _, _, d, h, w = image.shape
+                        pd, ph, pw = 64, 64, 64
+                        sd, sh, sw = max(0, (d - pd) // 2), max(0, (h - ph) // 2), max(0, (w - pw) // 2)
+                        patch = image[:, :, sd:sd+pd, sh:sh+ph, sw:sw+pw]
+                        
+                        # Паддинг до кратных 16
+                        _, _, pd_, ph_, pw_ = patch.shape
+                        nd = (pd_ + 15) // 16 * 16
+                        nh = (ph_ + 15) // 16 * 16
+                        nw = (pw_ + 15) // 16 * 16
+                        patch_padded = F.pad(patch, (0, nw - pw_, 0, nh - ph_, 0, nd - pd_), mode='constant', value=0)
+                        
+                        logits_tta = model(patch_padded)
+                        probs_tta = torch.sigmoid(logits_tta)
+                        
+                        # Обрезаем обратно
+                        logits_tta = logits_tta[:, :, :pd_, :ph_, :pw_]
+                        probs_tta = probs_tta[:, :, :pd_, :ph_, :pw_]
+                        
+                        entropy = -(probs_tta * torch.log(probs_tta + 1e-8) + (1 - probs_tta) * torch.log(1 - probs_tta + 1e-8)).mean()
+                        
+                        if entropy.item() < 0.5:
+                            entropy.backward()
+                            optimizer_tta.step()
+                            logger.info(f"TTA: адаптация выполнена (энтропия {entropy.item():.4f})")
+                        else:
+                            logger.info(f"TTA: пропущено (высокая энтропия {entropy.item():.4f})")
+                    model.eval()
+                # -------------------------------------------------------
+
                 # apply test time augmentation
                 if cfg.tta.invert:
                     image = 1 - image if image.mean() > cfg.tta.invert_mean_thresh else image

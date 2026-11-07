@@ -4,8 +4,8 @@ defaults:
   - _self_
 
 # i/o
-image_path: /path/to/image_folder #TODO
-output_folder: /path/to/output_folder # TODO
+image_path: "D:/vesselFM/my_data20_ready/no_inv"
+output_folder: "D:/vesselFM/my_output20_tta"
 file_app: ""
 
 mask_path: null
