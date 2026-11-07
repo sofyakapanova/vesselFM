@@ -12,3 +12,26 @@ runs
 ckpts
 outputs
 wandb
+# Данные и результаты
+my_data/
+my_data20_ready/
+my_output/
+my_output20_tta/
+my_output20_zero_shot/
+my_output_tta/
+my_output_zero_shot/
+my_output_zero_shot_backup/
+new_data_inv/
+new_data_no_inv/
+npz_data/
+test_data/
+test_data_backup/
+vessel_output/
+*.nii.gz
+*.vtk
+*.npz
+
+# Кэши и системные файлы
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

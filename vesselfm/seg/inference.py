@@ -14,6 +14,7 @@ from huggingface_hub import hf_hub_download
 from monai.inferers import SlidingWindowInfererAdapt
 from skimage.morphology import remove_small_objects
 from skimage.exposure import equalize_hist
+from scipy import ndimage as ndi
 
 from vesselfm.seg.utils.data import generate_transforms
 from vesselfm.seg.utils.evaluation import Evaluator, calculate_mean_metrics
@@ -157,12 +158,13 @@ def main(cfg):
                 image = transforms(image.astype(np.float32))[None].to(device)
                 mask = torch.tensor(read_nifti(mask_paths[idx])[0]).bool() if mask_paths else None
 
-                # --- TTA шаг (только для масштаба 1) ---
-                if scale == 1: # and False:  # <--- Временно отключаем TTA
+                # --- УЛУЧШЕННЫЙ TTA шаг (Topology-Aware) ---
+                if scale == 1:
                     model.train()
                     optimizer_tta.zero_grad()
+                    
                     with torch.enable_grad():
-                        # Вырезаем центральный патч 64x64x64 для экономии памяти
+                        # 1. Вырезаем центральный патч 64x64x64
                         _, _, d, h, w = image.shape
                         pd, ph, pw = 64, 64, 64
                         sd, sh, sw = max(0, (d - pd) // 2), max(0, (h - ph) // 2), max(0, (w - pw) // 2)
@@ -175,21 +177,30 @@ def main(cfg):
                         nw = (pw_ + 15) // 16 * 16
                         patch_padded = F.pad(patch, (0, nw - pw_, 0, nh - ph_, 0, nd - pd_), mode='constant', value=0)
                         
+                        # 2. Предсказание ДО шага (baseline топология)
+                        with torch.no_grad():
+                            logits_before = model(patch_padded)
+                            pred_before = (torch.sigmoid(logits_before) > 0.5).squeeze().cpu().numpy().astype(np.uint8)
+                            betti_before = ndi.label(pred_before > 0)[1]
+
+                        # 3. Прямой проход и энтропия
                         logits_tta = model(patch_padded)
                         probs_tta = torch.sigmoid(logits_tta)
-                        
-                        # Обрезаем обратно
-                        logits_tta = logits_tta[:, :, :pd_, :ph_, :pw_]
-                        probs_tta = probs_tta[:, :, :pd_, :ph_, :pw_]
-                        
                         entropy = -(probs_tta * torch.log(probs_tta + 1e-8) + (1 - probs_tta) * torch.log(1 - probs_tta + 1e-8)).mean()
                         
-                        if entropy.item() < 0.5:
+                        # 4. Предсказание ПОСЛЕ (но до обновления весов)
+                        with torch.no_grad():
+                            pred_after = (probs_tta > 0.5).squeeze().cpu().numpy().astype(np.uint8)
+                            betti_after = ndi.label(pred_after > 0)[1]
+                        
+                        # 5. Логика контроля
+                        if entropy.item() < 0.5 and betti_after <= betti_before + 10:
                             entropy.backward()
                             optimizer_tta.step()
-                            logger.info(f"TTA: адаптация выполнена (энтропия {entropy.item():.4f})")
+                            logger.info(f"TTA: OK (энтропия {entropy.item():.4f}, Betti: {betti_before} -> {betti_after})")
                         else:
-                            logger.info(f"TTA: пропущено (высокая энтропия {entropy.item():.4f})")
+                            logger.info(f"TTA: ПРОПУСК (энтропия {entropy.item():.4f}, Betti: {betti_before} -> {betti_after})")
+                            
                     model.eval()
                 # -------------------------------------------------------
 
