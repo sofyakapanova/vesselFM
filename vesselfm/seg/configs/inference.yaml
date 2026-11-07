@@ -5,7 +5,7 @@ defaults:
 
 # i/o
 image_path: "D:/vesselFM/my_data20_ready/no_inv"
-output_folder: "D:/vesselFM/my_output20_tta_topology_v2"
+output_folder: "D:/vesselFM/my_output20_tta_iterative"
 file_app: ""
 
 mask_path: null

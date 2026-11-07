@@ -158,13 +158,12 @@ def main(cfg):
                 image = transforms(image.astype(np.float32))[None].to(device)
                 mask = torch.tensor(read_nifti(mask_paths[idx])[0]).bool() if mask_paths else None
 
-                # --- Topology-Aware TTA v3 (умный контроль) ---
+                # --- Итеративный Topology-Aware TTA ---
                 if scale == 1:
                     model.train()
-                    optimizer_tta.zero_grad()
                     
                     with torch.enable_grad():
-                        # 1. Патч 64x64x64 (чтобы не было ошибки памяти)
+                        # 1. Патч 64x64x64
                         _, _, d, h, w = image.shape
                         pd, ph, pw = 64, 64, 64
                         sd, sh, sw = max(0, (d - pd) // 2), max(0, (h - ph) // 2), max(0, (w - pw) // 2)
@@ -177,29 +176,32 @@ def main(cfg):
                         nw = (pw_ + 15) // 16 * 16
                         patch_padded = F.pad(patch, (0, nw - pw_, 0, nh - ph_, 0, nd - pd_), mode='constant', value=0)
                         
-                        # 2. Предсказание ДО шага
+                        # 2. Базовый Betti-0
                         with torch.no_grad():
                             logits_before = model(patch_padded)
                             pred_before = (torch.sigmoid(logits_before) > 0.5).squeeze().cpu().numpy().astype(np.uint8)
                             betti_before = ndi.label(pred_before > 0)[1]
 
-                        # 3. Прямой проход и энтропия
-                        logits_tta = model(patch_padded)
-                        probs_tta = torch.sigmoid(logits_tta)
-                        entropy = -(probs_tta * torch.log(probs_tta + 1e-8) + (1 - probs_tta) * torch.log(1 - probs_tta + 1e-8)).mean()
-                        
-                        # 4. Предсказание ПОСЛЕ
-                        with torch.no_grad():
-                            pred_after = (probs_tta > 0.5).squeeze().cpu().numpy().astype(np.uint8)
-                            betti_after = ndi.label(pred_after > 0)[1]
-                        
-                        # 5. УМНЫЙ контроль: обновляем только если Betti не вырос (<= +1)
-                        if entropy.item() < 0.5 and betti_after <= betti_before + 1:
-                            entropy.backward()
-                            optimizer_tta.step()
-                            logger.info(f"TTA v3: OK (энтропия {entropy.item():.4f}, Betti: {betti_before} -> {betti_after})")
-                        else:
-                            logger.info(f"TTA v3: ПРОПУСК (энтропия {entropy.item():.4f}, Betti: {betti_before} -> {betti_after})")
+                        # 3. Итеративная адаптация (до 3 шагов)
+                        for step in range(3):
+                            optimizer_tta.zero_grad()
+                            logits_tta = model(patch_padded)
+                            probs_tta = torch.sigmoid(logits_tta)
+                            entropy = -(probs_tta * torch.log(probs_tta + 1e-8) + (1 - probs_tta) * torch.log(1 - probs_tta + 1e-8)).mean()
+                            
+                            with torch.no_grad():
+                                pred_after = (probs_tta > 0.5).squeeze().cpu().numpy().astype(np.uint8)
+                                betti_after = ndi.label(pred_after > 0)[1]
+                            
+                            # Если энтропия низкая и Betti не вырос (+1) — обновляем
+                            if entropy.item() < 0.5 and betti_after <= betti_before + 1:
+                                entropy.backward()
+                                optimizer_tta.step()
+                                logger.info(f"TTA шаг {step+1}: OK (энтропия {entropy.item():.4f}, Betti: {betti_before} -> {betti_after})")
+                                betti_before = betti_after # Обновляем планку для следующего шага
+                            else:
+                                logger.info(f"TTA шаг {step+1}: СТОП (Betti: {betti_before} -> {betti_after})")
+                                break # Если на этом шаге стало хуже — прекращаем цикл
                             
                     model.eval()
                 # -------------------------------------------------------
